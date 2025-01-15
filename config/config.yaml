@@ -1,0 +1,166 @@
+aws:
+  enabled: false
+  access_key: "YOUR_AWS_ACCESS_KEY"
+  secret_key: "YOUR_AWS_SECRET_KEY"
+  region: "us-west-2"
+  sagemaker:
+    instance_type: "ml.p3.2xlarge"
+    volume_size: 100
+    max_run_time: 86400
+    tags:
+      Environment: "development"
+
+baremetal:
+  enabled: false
+  ssh_key: "/path/to/your/ssh/key"
+  ssh_user: "ubuntu"
+  hosts:
+    - name: "worker1"
+      host: "192.168.1.100"
+      gpu: "nvidia-a100"
+    - name: "worker2"
+      host: "192.168.1.101"
+      gpu: "nvidia-a100"
+
+tracking:
+  mlflow:
+    enabled: false  # Set to true when MLflow server is ready
+    tracking_uri: "http://localhost:5000"
+    experiment_name: "llm-training"
+    
+  wandb:
+    enabled: false  # Set to true when W&B API key is configured
+    project_name: "llm-training"
+    api_key: "YOUR_WANDB_API_KEY"  # Replace with your 40-character W&B API key
+    tags:
+      - "llm"
+      - "fine-tuning"
+
+training:
+  default_model: "meta-llama/Llama-2-7b"
+  output_base_dir: "./data/models"
+  
+  # Default training configuration
+  defaults:
+    num_train_epochs: 3
+    per_device_train_batch_size: 8
+    per_device_eval_batch_size: 8
+    learning_rate: 5e-5
+    warmup_steps: 500
+    weight_decay: 0.01
+    gradient_accumulation_steps: 1
+    fp16: true
+    gradient_checkpointing: false
+    
+  # LoRA configuration
+  lora:
+    enabled: true
+    r: 8
+    alpha: 32
+    dropout: 0.1
+    
+  # DeepSpeed configuration
+  deepspeed:
+    enabled: false
+    config_path: "config/deepspeed_config.json"
+  
+  # Early stopping
+  early_stopping:
+    enabled: true
+    patience: 3
+    min_delta: 0.001
+    
+  # Checkpointing
+  checkpointing:
+    save_steps: 1000
+    save_total_limit: 5
+    save_safetensors: true
+    
+  # Evaluation
+  evaluation:
+    eval_steps: 500
+    eval_accumulation_steps: 1
+    metric_for_best_model: "eval_loss"
+    
+  # Logging
+  logging:
+    log_steps: 10
+    log_level: "info"
+    log_system_metrics: true
+
+data:
+  train_data_dir: "./data/training"
+  eval_data_dir: "./data/evaluation"
+  cache_dir: "./data/cache"
+  
+  preprocessing:
+    max_length: 512
+    text_column: "text"
+    validation_split: 0.1
+    clean_text: true
+    remove_duplicates: true
+
+inference:
+  max_batch_size: 16
+  default_temperature: 0.7
+  max_length: 2048
+  top_p: 0.95
+  top_k: 50
+  
+  # Model quantization
+  quantization:
+    enabled: false
+    bits: 8
+    group_size: 128
+    
+  # Caching
+  cache:
+    enabled: true
+    max_size: 1000
+    ttl: 3600
+
+model_providers:
+  huggingface:
+    enabled: true
+    models:
+      - name: "meta-llama/Llama-2-7b"
+        size: "7B"
+        description: "Llama 2 base model"
+        license: "llama2"
+        tags: ["base", "llama2"]
+      - name: "meta-llama/Llama-2-7b-chat"
+        size: "7B"
+        description: "Llama 2 chat model"
+        license: "llama2"
+        tags: ["chat", "llama2"]
+        
+  modelscope:
+    enabled: true
+    models:
+      - name: "qwen/Qwen-7B"
+        size: "7B"
+        description: "Qwen base model"
+        license: "qwen"
+        tags: ["base", "qwen"]
+      - name: "qwen/Qwen-7B-Chat"
+        size: "7B"
+        description: "Qwen chat model"
+        license: "qwen"
+        tags: ["chat", "qwen"]
+
+system:
+  gpu_memory_fraction: 0.9
+  cpu_threads: 4
+  log_level: "INFO"
+  log_dir: "./logs"
+  log_format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  log_file_format: "%Y%m%d_%H%M%S.log"
+  monitoring:
+    enabled: true
+    interval: 60
+    metrics:
+      - cpu
+      - memory
+      - gpu
+      - disk
+  temp_dir: "/tmp/illama2"
