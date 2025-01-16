@@ -19,18 +19,11 @@ from datetime import datetime
 import wandb
 import mlflow
 from mlflow.models import infer_signature
-import boto3
-from botocore.exceptions import ClientError
-import threading
-import queue
 from dataclasses import dataclass, asdict
-import numpy as np
-from accelerate import Accelerator
-from torch.utils.data import DataLoader
-import psutil
-import GPUtil
-from pathlib import Path
+from .config_loader import ConfigLoader, TrainingConfig as DeepSeekTrainingConfig
 from .model_provider import ModelProvider
+from pathlib import Path
+import time
 
 @dataclass
 class TrainingMetrics:
@@ -53,6 +46,7 @@ class TrainingMetrics:
 class TrainingConfig:
     model_name: str
     output_dir: str
+    log_dir: str
     num_train_epochs: int = 3
     per_device_train_batch_size: int = 8
     per_device_eval_batch_size: int = 8
@@ -85,31 +79,44 @@ class TrainingConfig:
         return asdict(self)
 
 class LLMTrainer:
-    def __init__(self, config_path: str):
-        self.config_path = config_path
-        self.config = self._load_config()
-        self.model_provider = ModelProvider(config_path)
-        self.setup_logging()
-        self.setup_tracking()
+    def __init__(self, config_loader: ConfigLoader):
+        """Initialize trainer with config loader"""
+        self.config_loader = config_loader
+        self.logger = logging.getLogger("illama.trainer")
+        self.model_provider = ModelProvider(config_loader)
         self.active_jobs = {}
         self.job_queues = {}
         self._setup_aws()
         
+    def _get_log_dir(self) -> str:
+        """Get the log directory, creating it if necessary"""
+        log_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'logs')
+        os.makedirs(log_dir, exist_ok=True)
+        return log_dir
+        
     def setup_logging(self):
-        logging.basicConfig(
-            level=logging.INFO,
-            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-            handlers=[
-                logging.FileHandler(f'training_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log'),
-                logging.StreamHandler()
-            ]
-        )
-        self.logger = logging.getLogger(__name__)
+        log_dir = self._get_log_dir()
+        log_file = os.path.join(log_dir, f'training_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log')
+        
+        # Create file handler
+        file_handler = logging.FileHandler(log_file)
+        file_handler.setLevel(logging.INFO)
+        file_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+        
+        # Create console handler
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(logging.INFO)
+        console_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+        
+        # Add handlers to logger
+        self.logger.addHandler(file_handler)
+        self.logger.addHandler(console_handler)
+        self.logger.setLevel(logging.INFO)
 
     def setup_tracking(self):
         """Setup experiment tracking with MLflow and Weights & Biases"""
         # Setup MLflow tracking
-        mlflow_config = self.config.get('tracking', {}).get('mlflow', {})
+        mlflow_config = self.config_loader.config.get('tracking', {}).get('mlflow', {})
         if mlflow_config.get('enabled', False):
             mlflow.set_tracking_uri(mlflow_config.get('tracking_uri', 'http://localhost:5000'))
             mlflow.set_experiment(mlflow_config.get('experiment_name', 'llm-training'))
@@ -118,7 +125,7 @@ class LLMTrainer:
             self.use_mlflow = False
 
         # Setup Weights & Biases tracking
-        wandb_config = self.config.get('tracking', {}).get('wandb', {})
+        wandb_config = self.config_loader.config.get('tracking', {}).get('wandb', {})
         if wandb_config.get('enabled', False):
             api_key = wandb_config.get('api_key', '')
             if api_key and len(api_key) == 40:  # Valid W&B API key is 40 characters
@@ -136,19 +143,15 @@ class LLMTrainer:
 
     def _setup_aws(self):
         """Setup AWS client for SageMaker integration"""
-        if self.config.get('aws', {}).get('enabled', False):
+        if self.config_loader.config.get('aws', {}).get('enabled', False):
             self.aws_client = boto3.client(
                 'sagemaker',
-                aws_access_key_id=self.config['aws']['access_key'],
-                aws_secret_access_key=self.config['aws']['secret_key'],
-                region_name=self.config['aws']['region']
+                aws_access_key_id=self.config_loader.config['aws']['access_key'],
+                aws_secret_access_key=self.config_loader.config['aws']['secret_key'],
+                region_name=self.config_loader.config['aws']['region']
             )
         else:
             self.aws_client = None
-
-    def _load_config(self) -> Dict:
-        with open(self.config_path, 'r') as f:
-            return yaml.safe_load(f)
 
     def prepare_dataset(
         self,
@@ -211,7 +214,16 @@ class LLMTrainer:
 
     def create_training_args(self, config: TrainingConfig) -> TrainingArguments:
         """Create training arguments from config"""
-        return TrainingArguments(
+        deepseek_config = DeepSeekTrainingConfig(self.config_loader.config)
+        
+        # Apply DeepSeek-style optimizations
+        if deepseek_config.is_moe_enabled:
+            config.gradient_checkpointing = True
+            config.fp16 = False  # Use FP8 instead
+            config.per_device_train_batch_size = self.config_loader.config['training_efficiency']['batch_size']
+            config.gradient_accumulation_steps = self.config_loader.config['training_efficiency']['gradient_accumulation_steps']
+            
+        args = TrainingArguments(
             output_dir=config.output_dir,
             num_train_epochs=config.num_train_epochs,
             per_device_train_batch_size=config.per_device_train_batch_size,
@@ -219,23 +231,33 @@ class LLMTrainer:
             warmup_steps=config.warmup_steps,
             weight_decay=config.weight_decay,
             logging_steps=config.logging_steps,
-            evaluation_strategy="steps" if config.eval_steps else "no",
+            evaluation_strategy=IntervalStrategy.STEPS if config.eval_steps else IntervalStrategy.NO,
             eval_steps=config.eval_steps,
             save_steps=config.save_steps,
             gradient_accumulation_steps=config.gradient_accumulation_steps,
+            max_steps=config.max_steps,
+            learning_rate=config.learning_rate,
             fp16=config.fp16,
             bf16=config.bf16,
-            learning_rate=config.learning_rate,
-            max_steps=config.max_steps,
             optim=config.optim,
             lr_scheduler_type=config.lr_scheduler_type,
             max_grad_norm=config.max_grad_norm,
             warmup_ratio=config.warmup_ratio,
             group_by_length=config.group_by_length,
             length_column_name=config.length_column_name,
-            report_to=config.report_to or ["none"],
+            report_to=config.report_to or ["wandb", "mlflow"],
             gradient_checkpointing=config.gradient_checkpointing,
         )
+        
+        # Apply DeepSeek memory optimizations
+        if deepseek_config.is_moe_enabled:
+            args.gradient_checkpointing_kwargs = {
+                "activation_recompute": self.config_loader.config['memory_optimization']['activation_recompute'],
+                "optimizer_states_dtype": self.config_loader.config['memory_optimization']['optimizer_states']['dtype'],
+                "activation_cache_dtype": self.config_loader.config['memory_optimization']['activation_cache']['dtype']
+            }
+            
+        return args
 
     def setup_tracking_experiment(
         self,
@@ -244,26 +266,26 @@ class LLMTrainer:
         metrics: Optional[Dict] = None
     ):
         """Setup experiment tracking for training job"""
-        if self.config.get('tracking', {}).get('mlflow', {}).get('enabled', False):
+        if self.config_loader.config.get('tracking', {}).get('mlflow', {}).get('enabled', False):
             mlflow.set_experiment(job_id)
             mlflow.start_run()
             mlflow.log_params(config.to_dict())
             if metrics:
                 mlflow.log_metrics(metrics)
 
-        if self.config.get('tracking', {}).get('wandb', {}).get('enabled', False):
+        if self.config_loader.config.get('tracking', {}).get('wandb', {}).get('enabled', False):
             wandb.init(
-                project=self.config['tracking']['wandb']['project_name'],
+                project=self.config_loader.config['tracking']['wandb']['project_name'],
                 name=job_id,
                 config=config.to_dict()
             )
 
     def log_metrics(self, metrics: Dict[str, float], step: Optional[int] = None):
         """Log metrics to tracking systems"""
-        if self.config.get('tracking', {}).get('mlflow', {}).get('enabled', False):
+        if self.config_loader.config.get('tracking', {}).get('mlflow', {}).get('enabled', False):
             mlflow.log_metrics(metrics, step=step)
 
-        if self.config.get('tracking', {}).get('wandb', {}).get('enabled', False):
+        if self.config_loader.config.get('tracking', {}).get('wandb', {}).get('enabled', False):
             wandb.log(metrics, step=step)
 
     def get_system_metrics(self) -> Dict[str, float]:
@@ -288,17 +310,45 @@ class LLMTrainer:
         return metrics
 
     def train(
-        self,
-        config: TrainingConfig,
-        train_dataset: Dataset,
-        eval_dataset: Optional[Dataset] = None,
-        resume_from_checkpoint: Optional[str] = None,
-    ) -> Dict[str, Any]:
+            self,
+            config: TrainingConfig,
+            train_dataset: Dataset,
+            eval_dataset: Optional[Dataset] = None,
+            resume_from_checkpoint: Optional[str] = None,
+        ):
         """Run training with the specified configuration"""
+        deepseek_config = DeepSeekTrainingConfig(self.config_loader.config)
+        
+        # Apply DeepSeek context length
+        max_length = deepseek_config.max_context_length
+        
+        # Setup distributed training if MoE is enabled
+        if deepseek_config.is_moe_enabled:
+            self._setup_distributed_training(self.config_loader.config['distributed_training'])
+            
+        # Continue with existing training logic
+        training_args = self.create_training_args(config)
+        
         # Generate unique job ID
         job_id = f"train_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         
         try:
+            # Create job directory in data/jobs
+            job_dir = self.config_loader.data_dir / "jobs" / f"job_{int(time.time())}"
+            job_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Save job config
+            with open(job_dir / "config.yaml", "w") as f:
+                yaml.dump(config.to_dict(), f)
+            
+            # Setup job-specific logging
+            job_log = self.config_loader.log_dir / f"job_{int(time.time())}.log"
+            job_handler = logging.FileHandler(job_log)
+            job_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+            self.logger.addHandler(job_handler)
+            
+            self.logger.info(f"Starting training job in {job_dir}")
+            
             # Setup tracking
             self.setup_tracking_experiment(job_id, config)
             
@@ -339,7 +389,7 @@ class LLMTrainer:
             tokenizer.save_pretrained(config.output_dir)
             
             # Save model signature for MLflow
-            if self.config.get('tracking', {}).get('mlflow', {}).get('enabled', False):
+            if self.config_loader.config.get('tracking', {}).get('mlflow', {}).get('enabled', False):
                 signature = infer_signature(
                     train_dataset.select(range(min(5, len(train_dataset)))),
                     model(torch.tensor([[0]])).logits.detach().numpy()
@@ -496,3 +546,15 @@ class LLMTrainer:
                 "status": "error",
                 "message": f"Failed to export artifacts: {str(e)}"
             }
+
+    def _setup_distributed_training(self, dist_config: Dict[str, Any]):
+        """Setup distributed training based on DeepSeek configuration"""
+        if dist_config['pipeline']['type'] == 'DualPipe':
+            os.environ['PIPELINE_TYPE'] = 'dual'
+            os.environ['NUM_PIPELINE_STAGES'] = str(dist_config['pipeline']['num_stages'])
+        
+        if 'expert_parallel' in dist_config:
+            os.environ['NUM_EXPERTS'] = str(dist_config['expert_parallel']['num_experts'])
+            
+        if dist_config['data_parallel']['type'] == 'ZeRO-1':
+            os.environ['ZERO_STAGE'] = '1'

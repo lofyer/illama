@@ -7,6 +7,7 @@ from modelscope import snapshot_download
 import torch
 import logging
 import yaml
+from pathlib import Path
 
 @dataclass
 class ModelInfo:
@@ -18,10 +19,11 @@ class ModelInfo:
     tags: List[str]
 
 class ModelProvider:
-    def __init__(self, config_path: str = "config/config.yaml"):
-        self.config = yaml.safe_load(open(config_path))
-        self.model_cache_dir = self.config['data']['cache_dir']
-        self.logger = logging.getLogger(__name__)
+    def __init__(self, config_loader):
+        self.config_loader = config_loader
+        self.config = config_loader.get_config()
+        self.model_cache_dir = self.config_loader.data_dir / "cache"
+        self.logger = logging.getLogger("illama.model_provider")
         
         # Initialize providers
         self.providers = {
@@ -51,20 +53,20 @@ class ModelProvider:
             ],
             'modelscope': [
                 ModelInfo(
-                    name="qwen/Qwen-7B",
+                    name="deepseek-ai/deepseek-moe-16b-base",
                     provider="modelscope",
-                    size="7B",
-                    description="Qwen base model",
-                    license="qwen",
-                    tags=["base", "qwen"]
+                    size="16B",
+                    description="DeepSeek MoE base model",
+                    license="deepseek",
+                    tags=["base", "moe"]
                 ),
                 ModelInfo(
-                    name="qwen/Qwen-7B-Chat",
+                    name="deepseek-ai/deepseek-moe-16b-chat",
                     provider="modelscope",
-                    size="7B",
-                    description="Qwen chat model",
-                    license="qwen",
-                    tags=["chat", "qwen"]
+                    size="16B",
+                    description="DeepSeek MoE chat model",
+                    license="deepseek",
+                    tags=["chat", "moe"]
                 )
             ]
         }
